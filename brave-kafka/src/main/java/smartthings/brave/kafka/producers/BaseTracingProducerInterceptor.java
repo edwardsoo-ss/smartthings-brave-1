@@ -14,17 +14,16 @@
  */
 package smartthings.brave.kafka.producers;
 
-import brave.Span;
-import brave.Tracer;
 import brave.propagation.TraceContext;
 import com.github.kristofa.brave.ClientTracer;
-import com.github.kristofa.brave.SpanIdUtils;
+import com.github.kristofa.brave.KafkaTracingUtils;
+import com.github.kristofa.brave.SpanId;
+import com.github.kristofa.brave.SpanUtils;
+import com.twitter.zipkin.gen.Endpoint;
 import org.apache.kafka.clients.producer.ProducerInterceptor;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.config.ConfigException;
-import zipkin.Constants;
-import zipkin.Endpoint;
 
 import java.util.Map;
 
@@ -33,9 +32,8 @@ import java.util.Map;
  * and injects the tracing context by mutating {@link ProducerRecord} before it is sent.
  * Injection is left abstract to allow implementations for different strategies.
  *
- * Required: A {@link Tracer} in config as "brave.tracer".
+ * Required: A {@link ClientTracer} in config as "brave.client.tracer" to create child span instead of new.
  * Optional: A {@link SpanNameProvider} in config as "brave.span.name.provider" to customize span name.
- * Optional: A {@link ClientTracer} in config as "brave.client.tracer" to create child span instead of new.
  * Optional: A {@link Endpoint} in config as "brave.span.remote.endpoint" to customize span remote endpoint.
  * @param <K> key type
  */
@@ -44,22 +42,19 @@ public abstract class BaseTracingProducerInterceptor<K> implements ProducerInter
   protected abstract ProducerRecord<K, byte[]> getTracedProducerRecord(TraceContext traceContext,
                                                                        ProducerRecord<K, byte[]> originalRecord);
 
-  private Tracer tracer;
   private ClientTracer clientTracer;
   private SpanNameProvider<K> nameProvider;
-  private Endpoint kafkaEndpoint;
+  private com.twitter.zipkin.gen.Endpoint remoteEndpoint;
 
   @Override
   public ProducerRecord<K, byte[]> onSend(ProducerRecord<K, byte[]> record) {
-    Span span = SpanIdUtils.getNextSpan(clientTracer, tracer)
-      .name(nameProvider.spanName(record))
-      .annotate(Constants.CLIENT_SEND)
-      .remoteEndpoint(kafkaEndpoint);
-    if (record.partition() != null) {
-      span.tag("Partition", record.partition().toString());
-    }
-    TraceContext ctx = span.context();
-    span.flush();
+    SpanId spanId = KafkaTracingUtils.reportClientSentSpan(
+      clientTracer,
+      nameProvider.spanName(record),
+      remoteEndpoint,
+      record.partition()
+    );
+    TraceContext ctx = SpanUtils.spanIdToTraceContext(spanId);
     return getTracedProducerRecord(ctx, record);
   }
 
@@ -75,11 +70,11 @@ public abstract class BaseTracingProducerInterceptor<K> implements ProducerInter
 
   @Override
   public void configure(Map<String, ?> configs) {
-    if (configs.get("brave.tracer") == null
-      || !(configs.get("brave.tracer") instanceof Tracer)) {
-      throw new ConfigException("brave.tracer", configs.get("brave.tracer"), "Must an be instance of brave.Tracer");
+    if (configs.get("brave.client.tracer") != null
+      && configs.get("brave.client.tracer") instanceof ClientTracer) {
+      clientTracer = (ClientTracer) configs.get("brave.client.tracer");
     } else {
-      tracer = (Tracer) configs.get("brave.tracer");
+      throw new ConfigException("brave.client.tracer", configs.get("brave.client.tracer"), "Must an be instance of com.github.kristofa.brave.ClientTracer");
     }
 
     if (configs.get("brave.span.name.provider") != null
@@ -89,16 +84,11 @@ public abstract class BaseTracingProducerInterceptor<K> implements ProducerInter
       nameProvider = new DefaultSpanNameProvider<>();
     }
 
-    if (configs.get("brave.client.tracer") != null
-      && configs.get("brave.client.tracer") instanceof ClientTracer) {
-      clientTracer = (ClientTracer) configs.get("brave.client.tracer");
-    }
-
     if (configs.get("brave.span.remote.endpoint") != null
       && configs.get("brave.span.remote.endpoint") instanceof Endpoint) {
-      kafkaEndpoint = (Endpoint) configs.get("brave.span.remote.endpoint");
+      remoteEndpoint = (Endpoint) configs.get("brave.span.remote.endpoint");
     } else {
-      kafkaEndpoint = Endpoint.builder().serviceName("Kafka").build();
+      remoteEndpoint = Endpoint.builder().serviceName("Kafka").build();
     }
   }
 }

@@ -14,23 +14,20 @@
  */
 package smartthings.brave.kafka.consumers;
 
-import brave.Tracer;
 import brave.propagation.TraceContext;
-import brave.sampler.Sampler;
+import com.github.kristofa.brave.*;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Int64Value;
 import com.google.protobuf.InvalidProtocolBufferException;
+import com.twitter.zipkin.gen.Endpoint;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.TopicPartition;
 import org.junit.Before;
 import org.junit.Test;
-import org.mockito.ArgumentCaptor;
 import smartthings.brave.kafka.EnvelopeProtos;
-import zipkin.Constants;
-import zipkin.Endpoint;
 import zipkin.Span;
 import zipkin.reporter.Reporter;
 
@@ -44,15 +41,13 @@ import static org.mockito.Mockito.*;
 public class DefaultTracingConsumerInterceptorTest {
 
   private final Reporter<Span> reporter = mock(Reporter.class);
-  private final Tracer tracer = Tracer.newBuilder()
-    .localServiceName("test")
-    .sampler(Sampler.ALWAYS_SAMPLE)
-    .traceId128Bit(true)
-    .reporter(reporter)
-    .build();
   private final SpanNameProvider<String> nameProvider = mock(SpanNameProvider.class);
   private final Endpoint endpoint = Endpoint.builder().serviceName("test-service").build();
-  private final ArgumentCaptor<Span> spanCaptor = ArgumentCaptor.forClass(Span.class);
+  private final TestServerTracer serverTracer = mock(TestServerTracer.class);
+  private final TestRecorder recorder = mock(TestRecorder.class);
+  private final com.twitter.zipkin.gen.Span span = mock(com.twitter.zipkin.gen.Span.class);
+  private final ServerSpanState serverSpanState = mock(ServerSpanState.class);
+  private final ServerSpan serverSpan = mock(ServerSpan.class);
 
   private DefaultTracingConsumerInterceptor<String> interceptor;
 
@@ -60,7 +55,7 @@ public class DefaultTracingConsumerInterceptorTest {
   public void setUp() {
     interceptor = new DefaultTracingConsumerInterceptor<>();
     interceptor.configure(ImmutableMap.of(
-      "brave.tracer", tracer,
+      "brave.server.tracer", serverTracer,
       "brave.span.name.provider", nameProvider,
       "brave.span.remote.endpoint", endpoint
     ));
@@ -90,15 +85,22 @@ public class DefaultTracingConsumerInterceptorTest {
       .build();
 
     EnvelopeProtos.Envelope envelope = EnvelopeProtos.Envelope.newBuilder()
-      .setTraceId(traceId)
-      .setTraceIdHigh(traceIdHigh)
-      .setParentId(Int64Value.newBuilder().setValue(parentId))
-      .setSpanId(spanId)
-      .setShared(false)
+      .setTraceContext(
+        EnvelopeProtos.TraceContext.newBuilder()
+          .setTraceId(traceId)
+          .setTraceIdHigh(traceIdHigh)
+          .setParentId(Int64Value.newBuilder().setValue(parentId))
+          .setSpanId(spanId)
+          .setShared(false)
+      )
       .setPayload(ByteString.copyFrom(value))
       .build();
 
     when(nameProvider.spanName(any())).thenReturn(spanName);
+    when(serverTracer.currentSpan()).thenReturn(new ServerSpanThreadBinder(serverSpanState));
+    when(serverTracer.recorder()).thenReturn(recorder);
+    when(serverSpanState.getCurrentServerSpan()).thenReturn(serverSpan);
+    when(serverSpan.getSpan()).thenReturn(span);
 
     // method under test
     ConsumerRecords<String, byte[]> records = interceptor.onConsume(new ConsumerRecords<>(ImmutableMap.of(
@@ -118,12 +120,7 @@ public class DefaultTracingConsumerInterceptorTest {
 
     assertEquals(expectedTraceContext, tracedRecord.traceContextOrSamplingFlags.context());
 
-    verify(reporter).report(spanCaptor.capture());
-    Span capturedSpan = spanCaptor.getValue();
-    assertEquals(spanId, capturedSpan.id);
-    assertEquals(parentId, capturedSpan.parentId);
-    assertEquals(traceId, capturedSpan.traceId);
-    assertEquals(traceIdHigh, capturedSpan.traceIdHigh);
-    assertEquals(Constants.SERVER_RECV, capturedSpan.annotations.get(0).value);
+    verify(serverTracer).setServerReceived(endpoint);
+    verify(recorder).flush(span);
   }
 }

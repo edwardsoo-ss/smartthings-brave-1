@@ -14,12 +14,8 @@
  */
 package com.github.kristofa.brave;
 
-/**
- * Just so we can stub com.github.kristofa.brave.TestClientTracer#maybeParent()
- */
-public abstract class TestClientTracer extends ClientTracer  {
+import com.twitter.zipkin.gen.Span;
 
-  public abstract ClientSpanThreadBinder currentSpan();
-
-  public abstract Recorder recorder();
+public abstract class TestRecorder extends Recorder {
+  public abstract void flush(Span span);
 }

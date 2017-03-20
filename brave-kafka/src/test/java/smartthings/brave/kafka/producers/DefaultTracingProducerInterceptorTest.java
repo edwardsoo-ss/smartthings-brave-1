@@ -14,22 +14,16 @@
  */
 package smartthings.brave.kafka.producers;
 
-import brave.Tracer;
 import brave.propagation.TraceContext;
-import brave.sampler.Sampler;
-import com.github.kristofa.brave.SpanId;
-import com.github.kristofa.brave.SpanIdUtils;
-import com.github.kristofa.brave.TestClientTracer;
+import com.github.kristofa.brave.*;
 import com.google.common.collect.ImmutableMap;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
+import com.twitter.zipkin.gen.Endpoint;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.junit.Before;
 import org.junit.Test;
 import smartthings.brave.kafka.EnvelopeProtos;
-import zipkin.Endpoint;
-import zipkin.Span;
-import zipkin.reporter.Reporter;
 
 import java.util.UUID;
 
@@ -39,16 +33,12 @@ import static org.mockito.Mockito.*;
 
 public class DefaultTracingProducerInterceptorTest {
 
-  private final Reporter<Span> reporter = mock(Reporter.class);
   private final TestClientTracer clientTracer = mock(TestClientTracer.class);
-  private final Tracer tracer = Tracer.newBuilder()
-    .localServiceName("test")
-    .sampler(Sampler.ALWAYS_SAMPLE)
-    .traceId128Bit(true)
-    .reporter(reporter)
-    .build();
   private final SpanNameProvider<String> nameProvider = mock(SpanNameProvider.class);
   private final Endpoint endpoint = Endpoint.builder().serviceName("test-service").build();
+  private final ClientSpanState clientSpanState = mock(ClientSpanState.class);
+  private final com.twitter.zipkin.gen.Span span = mock(com.twitter.zipkin.gen.Span.class);
+  private final TestRecorder recorder = mock(TestRecorder.class);
 
   private DefaultTracingProducerInterceptor<String> interceptor;
 
@@ -56,12 +46,10 @@ public class DefaultTracingProducerInterceptorTest {
   public void setUp() {
     interceptor = new DefaultTracingProducerInterceptor<>();
     interceptor.configure(ImmutableMap.of(
-      "brave.tracer", tracer,
       "brave.client.tracer", clientTracer,
       "brave.span.name.provider", nameProvider,
       "brave.span.remote.endpoint", endpoint
     ));
-    reset(clientTracer, reporter, nameProvider);
   }
 
   @Test
@@ -69,21 +57,26 @@ public class DefaultTracingProducerInterceptorTest {
     String topic = "my-topic";
     String key = "ayyy";
     byte[] value = "lmao".getBytes();
-    UUID traceIdWhole = UUID.randomUUID();
-    long traceId = traceIdWhole.getLeastSignificantBits();
-    long traceIdHigh = traceIdWhole.getMostSignificantBits();
+    long traceId = UUID.randomUUID().getLeastSignificantBits();
+    long traceIdHigh = UUID.randomUUID().getLeastSignificantBits();
+    long spanId = UUID.randomUUID().getLeastSignificantBits();
     String spanName = "span-name";
-    TraceContext parentTraceContext = TraceContext.newBuilder()
+    TraceContext traceContext = TraceContext.newBuilder()
       .traceIdHigh(traceIdHigh)
       .traceId(traceId)
-      .spanId(traceId)
+      .spanId(spanId)
       .shared(false)
+      .parentId(traceId)
       .build();
-    SpanId parentSpan = SpanIdUtils.traceContextToSpanId(parentTraceContext);
+
+
+    SpanId spanIdCtx = SpanUtils.traceContextToSpanId(traceContext);
 
     when(nameProvider.spanName(any())).thenReturn(spanName);
-    when(clientTracer.maybeParent()).thenReturn(parentSpan);
-
+    when(clientTracer.startNewSpan(spanName)).thenReturn(spanIdCtx);
+    when(clientTracer.currentSpan()).thenReturn(new ClientSpanThreadBinder(clientSpanState));
+    when(clientTracer.recorder()).thenReturn(recorder);
+    when(clientSpanState.getCurrentClientSpan()).thenReturn(span);
 
     // method under test
     ProducerRecord<String, byte[]> injectedRecord = interceptor
@@ -93,11 +86,13 @@ public class DefaultTracingProducerInterceptorTest {
     assertEquals(topic, injectedRecord.topic());
     assertEquals(null, injectedRecord.partition());
 
-    assertEquals(traceId, envelope.getTraceId());
-    assertEquals(traceIdHigh, envelope.getTraceIdHigh());
-    assertEquals(traceId, envelope.getParentId().getValue());
+    assertEquals(traceId, envelope.getTraceContext().getTraceId());
+    assertEquals(traceIdHigh, envelope.getTraceContext().getTraceIdHigh());
+    assertEquals(traceId, envelope.getTraceContext().getParentId().getValue());
     assertEquals(ByteString.copyFrom(value), envelope.getPayload());
-    assertNotEquals(traceId, envelope.getSpanId());
-    assert(envelope.getSpanId() != 0);
+    assertNotEquals(traceId, envelope.getTraceContext().getSpanId());
+    assert(envelope.getTraceContext().getSpanId() != 0);
+
+    verify(recorder).flush(span);
   }
 }
